@@ -226,9 +226,11 @@ namespace Antmicro.Renode.Peripherals.DMA
                 var registersMap = new Dictionary<long, DoubleWordRegister>();
                 registersMap.Add((long)ChannelRegisters.ChannelConfiguration + (number * ShiftBetweenChannels), new DoubleWordRegister(parent)
                     .WithFlag(0, out channelEnable,
-                        writeCallback: (_, val) =>
+                        writeCallback: (oldVal, val) =>
                         {
-                            if(!val)
+                            // Only the 0 -> 1 transition starts a transfer: software rewrites CCR with
+                            // EN still set (read-modify-write of the interrupt enables) while a channel runs.
+                            if(!val || oldVal)
                             {
                                 return;
                             }
@@ -237,7 +239,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                                 DoTransfer();
                             }
                         },
-                        valueProviderCallback: _ => false, name: "Channel enable (EN)")
+                        name: "Channel enable (EN)")
                     .WithFlag(1, out transferCompleteInterruptEnable, name: "Transfer complete interrupt enable (TCIE)")
                     .WithFlag(2, out halfTransferInterruptEnable, name: "Half transfer interrupt enable (HTIE)")
                     .WithTag("Transfer error interrupt enable (TEIE)", 3, 1)
@@ -345,6 +347,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                 // a peripheral.
                 if(transferDirection.Value == TransferDirection.PeripheralToMemory)
                 {
+                    var remainingBefore = dataCount.Value;
                     var toCopy = (uint)dataCount.Value;
                     // In peripheral-to-memory mode, only copy one data unit. Otherwise, do the whole block.
                     if(!memoryToMemory.Value)
@@ -362,8 +365,16 @@ namespace Antmicro.Renode.Peripherals.DMA
                         memoryTransferType.Value);
                     currentPeripheralAddress = response.ReadAddress.Value;
                     currentMemoryAddress = response.WriteAddress.Value;
-                    HalfTransfer = dataCount.Value <= originalDataCount / 2;
-                    TransferComplete = dataCount.Value == 0;
+                    // The flags are set by the transfer that reaches the half-way point or the end, and
+                    // only software clears them (through IFCR), as on hardware.
+                    if(remainingBefore > originalDataCount / 2 && dataCount.Value <= originalDataCount / 2)
+                    {
+                        HalfTransfer = true;
+                    }
+                    if(dataCount.Value == 0)
+                    {
+                        TransferComplete = true;
+                    }
                 }
                 else // 1-bit field, so we handle both possible values
                 {
