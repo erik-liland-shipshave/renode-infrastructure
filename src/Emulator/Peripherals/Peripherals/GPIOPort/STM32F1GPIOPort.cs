@@ -285,7 +285,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         private enum OutputMode
         {
-            ResetValue = GeneralPurposePushPull,
+            // CNF = 01 at reset: with MODE = 00 (input) this is a floating input, so CRL/CRH read 0x44444444
+            ResetValue = GeneralPurposeOpenDrain,
             GeneralPurposePushPull = 0,
             GeneralPurposeOpenDrain = 1,
             AlternateFunctionPushPull = 2,
