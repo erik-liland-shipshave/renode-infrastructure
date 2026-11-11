@@ -65,10 +65,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 var lowId = offset / 4;
                 var highId = lowId + 8;
 
-                configurationLowRegister.DefineEnumField<PinMode>(offset, 2, name: $"MODE{lowId}", writeCallback: (_, value) => pins[lowId] = value, valueProviderCallback: _ => pins[lowId]);
+                configurationLowRegister.DefineEnumField<PinMode>(offset, 2, name: $"MODE{lowId}", writeCallback: (_, value) => ChangePinMode(lowId, value), valueProviderCallback: _ => pins[lowId]);
                 configurationLowRegister.DefineEnumField<OutputMode>(offset + 2, 2, name: $"CNF{lowId}", writeCallback: (_, value) => ChangeOutputMode(lowId, value), valueProviderCallback: _ => pinsOutputMode[lowId]);
 
-                configurationHighRegister.DefineEnumField<PinMode>(offset, 2, name: $"MODE{highId}", writeCallback: (_, value) => pins[highId] = value, valueProviderCallback: _ => pins[highId]);
+                configurationHighRegister.DefineEnumField<PinMode>(offset, 2, name: $"MODE{highId}", writeCallback: (_, value) => ChangePinMode(highId, value), valueProviderCallback: _ => pins[highId]);
                 configurationHighRegister.DefineEnumField<OutputMode>(offset + 2, 2, name: $"CNF{highId}", writeCallback: (_, value) => ChangeOutputMode(highId, value), valueProviderCallback: _ => pinsOutputMode[highId]);
             }
 
@@ -82,7 +82,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 },
                 {(long)Registers.OutputData, new DoubleWordRegister(this)
                     // upper 16 bits are reserved
-                    .WithValueField(0, 16, name: "ODR", writeCallback: (_, value) => SetConnectionsStateUsingBits((uint)value), valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(Connections.Values.Select(x=>x.IsSet)))
+                    .WithValueField(0, 16, name: "ODR", writeCallback: (_, value) => WriteOutputData((uint)value), valueProviderCallback: _ => outputData)
                 },
                 {(long)Registers.BitSetReset, new DoubleWordRegister(this)
                     .WithValueField(16, 16, FieldMode.Write, name: "BR", writeCallback: (_, value) => SetBitsFromMask((uint)value, false))
@@ -112,6 +112,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 return;
             }
 
+            // From now on the pin follows the external signal rather than its pull-up/pull-down.
+            externallyDriven[number] = true;
             base.OnGPIO(number, value);
             Connections[number].Set(value);
         }
@@ -120,11 +122,13 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             base.Reset();
             registers.Reset();
+            outputData = 0;
             for(var i = 0; i < NumberOfPorts; i++)
             {
                 AlternateFunctionOutputs[i].Reset();
-                ChangeOutputMode(i, OutputMode.ResetValue);
+                externallyDriven[i] = false;
                 pins[i] = PinMode.ResetValue;
+                ChangeOutputMode(i, OutputMode.ResetValue);
             }
         }
 
@@ -170,24 +174,84 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
         }
 
+        private void ChangePinMode(int number, PinMode newMode)
+        {
+            pins[number] = newMode;
+            UpdatePin(number);
+        }
+
         private void ChangeOutputMode(int number, OutputMode newMode)
         {
             pinsOutputMode[number] = newMode;
-            AlternateFunctionOutputs[number].IsConnected = (newMode == OutputMode.AlternateFunctionOpenDrain || newMode == OutputMode.AlternateFunctionPushPull);
+            UpdatePin(number);
+        }
+
+        private void UpdatePin(int number)
+        {
+            // In input mode, CNF selects analog/floating/pull-up-pull-down, so an alternate function
+            // can only drive the pin in one of the output modes.
+            AlternateFunctionOutputs[number].IsConnected = pins[number] != PinMode.Input
+                && (pinsOutputMode[number] == OutputMode.AlternateFunctionOpenDrain || pinsOutputMode[number] == OutputMode.AlternateFunctionPushPull);
+            ApplyPull(number);
+        }
+
+        // RM0008 9.1.1: an input with CNF = 10 is pulled up when its ODR bit is 1 and pulled down when it is 0.
+        // The pull sets the pin level until a signal arrives through OnGPIO.
+        private bool IsPulledInput(int number)
+        {
+            return pins[number] == PinMode.Input && (int)pinsOutputMode[number] == InputPullUpPullDown;
+        }
+
+        private void ApplyPull(int number)
+        {
+            if(!IsPulledInput(number) || externallyDriven[number])
+            {
+                return;
+            }
+            var level = (outputData & (1u << number)) != 0;
+            State[number] = level;
+            Connections[number].Set(level);
+        }
+
+        private void WriteOutputData(uint value)
+        {
+            for(var i = 0; i < NumberOfPorts; i++)
+            {
+                SetOutputBit(i, (value & (1u << i)) != 0);
+            }
+        }
+
+        private void SetOutputBit(int number, bool state)
+        {
+            if(state)
+            {
+                outputData |= 1u << number;
+            }
+            else
+            {
+                outputData &= ~(1u << number);
+            }
+
+            if(pins[number] == PinMode.Input)
+            {
+                ApplyPull(number);
+                return;
+            }
+
+            Connections[number].Set(state);
+            State[number] = state;
         }
 
         private void SetBitsFromMask(uint mask, bool state)
         {
             foreach(var bit in BitHelper.GetSetBits(mask))
             {
-                if(pins[bit] == PinMode.Input)
+                if(pins[bit] == PinMode.Input && !IsPulledInput(bit))
                 {
                     this.Log(LogLevel.Warning, "Trying to set the state of the input pin #{0}", bit);
-                    continue;
                 }
 
-                Connections[bit].Set(state);
-                State[bit] = state;
+                SetOutputBit(bit, state);
             }
         }
 
@@ -196,6 +260,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private readonly DoubleWordRegisterCollection registers;
         private readonly PinMode[] pins;
         private readonly OutputMode[] pinsOutputMode;
+        private readonly bool[] externallyDriven = new bool[NumberOfPorts];
+        private uint outputData;
+
+        private const int InputPullUpPullDown = 2; // CNF value in input mode
 
         private const int NumberOfPorts = 16;
         private const int NumberOfTimers = 18;
