@@ -20,7 +20,10 @@ namespace Antmicro.Renode.Peripherals.SPI
 {
     public sealed class STM32SPI : NullRegistrationPointPeripheralContainer<ISPIPeripheral>, IWordPeripheral, IDoubleWordPeripheral, IBytePeripheral, IKnownSize, ISPIController
     {
-        public STM32SPI(IMachine machine, STM32Series series, int bufferCapacity = DefaultBufferCapacity) : base(machine)
+        // bufferCapacity: depth of the receive buffer in bytes. When not given, it follows the series:
+        // F1, F4, L0 and L1 have a single receive buffer (a new byte that arrives while RXNE is set is lost
+        // and OVR is raised), the other supported series have a 32-bit RX FIFO.
+        public STM32SPI(IMachine machine, STM32Series series, int? bufferCapacity = null) : base(machine)
         {
             var supportedSeries = new List<STM32Series>{
                 STM32Series.F0,
@@ -38,7 +41,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
             this.series = series;
 
-            receiveBuffer = new CircularBuffer<byte>(bufferCapacity);
+            receiveBuffer = new CircularBuffer<byte>(bufferCapacity ?? DefaultBufferCapacityFor(series));
             IRQ = new GPIO();
             DMAReceive = new GPIO();
             DMASend = new GPIO();
@@ -353,7 +356,22 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private readonly STM32Series series;
 
-        private const int DefaultBufferCapacity = 4;
+        private static int DefaultBufferCapacityFor(STM32Series series)
+        {
+            switch(series)
+            {
+            case STM32Series.F1:
+            case STM32Series.F4:
+            case STM32Series.L0:
+            case STM32Series.L1:
+                return SingleBufferCapacity;
+            default:
+                return FifoBufferCapacity;
+            }
+        }
+
+        private const int SingleBufferCapacity = 1;
+        private const int FifoBufferCapacity = 4;
 
         private enum Registers
         {
